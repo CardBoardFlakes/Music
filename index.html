@@ -7,10 +7,8 @@
   window.dataLayer = window.dataLayer || [];
   function gtag(){dataLayer.push(arguments);}
   gtag('js', new Date());
-
   gtag('config', 'G-1VTG5RCHR4');
 </script>
-
 <link rel="shortcut icon" type="image/x-icon" href="favicon.ico?">
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -80,6 +78,7 @@ input[type=text]:focus,input[type=url]:focus{border-color:var(--accent);}
 .tr-del{background:none;border:none;color:var(--muted);cursor:pointer;font-size:.66rem;padding:2px 4px;transition:color .12s;}
 .tr-del:hover{color:var(--accent2);}
 .empty{padding:42px 20px;text-align:center;color:var(--muted);font-size:.7rem;letter-spacing:1px;}
+.tr-offline{font-size:.48rem;color:var(--accent2);letter-spacing:1px;text-transform:uppercase;border:1px solid var(--accent2);padding:1px 5px;white-space:nowrap;flex-shrink:0;}
 </style>
 </head>
 <body>
@@ -90,7 +89,6 @@ input[type=text]:focus,input[type=url]:focus{border-color:var(--accent);}
     <div class="logo-sub" style="margin-bottom:5px">music player</div>
   </header>
 
-  <!-- NOW PLAYING -->
   <div class="card">
     <div id="prog-line"></div>
     <div class="track-title" id="track-title">No track loaded</div>
@@ -115,13 +113,11 @@ input[type=text]:focus,input[type=url]:focus{border-color:var(--accent);}
     </div>
   </div>
 
-  <!-- YOUTUBE EMBED -->
   <div id="yt-panel">
     <div id="yt-player"></div>
     <div class="yt-note">YouTube · use play/pause button below or player controls above</div>
   </div>
 
-  <!-- ADD TRACKS -->
   <div class="card" style="padding:20px 24px;">
     <div class="panel-lbl">Add tracks</div>
     <div class="add-tabs">
@@ -135,7 +131,7 @@ input[type=text]:focus,input[type=url]:focus{border-color:var(--accent);}
           Drop audio files here or click to browse<br>
           <span style="font-size:.56rem;letter-spacing:2px;margin-top:6px;display:block">MP3 · WAV · OGG · FLAC · AAC · M4A</span>
         </div>
-        <p class="file-note">⚠ Local files are session-only. YouTube &amp; URL tracks save automatically.</p>
+        <p class="file-note">⚠ After reload, local files show as offline — drop them in again to restore. YouTube &amp; URL tracks save fully.</p>
       </div>
       <input type="file" id="file-in" accept="audio/*" multiple style="display:none" onchange="addFiles(this.files)">
     </div>
@@ -163,7 +159,6 @@ input[type=text]:focus,input[type=url]:focus{border-color:var(--accent);}
     </div>
   </div>
 
-  <!-- PLAYLIST -->
   <div class="playlist">
     <div class="pl-hdr">
       <span class="pl-title">Playlist</span>
@@ -176,31 +171,15 @@ input[type=text]:focus,input[type=url]:focus{border-color:var(--accent);}
 
 <script src="https://www.youtube.com/iframe_api"></script>
 <script>
-// ═══════════════════════════════════════════════════════════
-// ARCHITECTURE NOTE:
-//   The <audio> element plays audio directly — it is NEVER
-//   routed through an AudioContext. That caused silent failures
-//   in sandboxed environments. The AudioContext is created
-//   separately and only used to read FFT data for the
-//   visualiser via a second MediaElementSource connection
-//   that happens exactly once after the first user gesture.
-// ═══════════════════════════════════════════════════════════
+var tracks = [], cur = -1, playing = false, doShuffle = false, doLoop = false, isSeeking = false;
 
-// ── State ──────────────────────────────────────────────────
-var tracks    = [];
-var cur       = -1;
-var playing   = false;
-var doShuffle = false;
-var doLoop    = false;
-var isSeeking = false;
-
-// ── Audio element ───────────────────────────────────────────
-// Plain Audio() with no crossOrigin, no AudioContext routing.
-// It plays audio by itself — perfectly reliably.
+// ── Audio element ─────────────────────────────────────────
+// Never routed through AudioContext. Plays independently.
+// aud.src is ALWAYS set to '' when a YouTube track is active
+// so that timeupdate can never fire and corrupt the progress bar.
 var aud = new Audio();
 aud.volume = 0.8;
 
-// Progress bar — driven by timeupdate, the only reliable method
 aud.addEventListener('timeupdate', function () {
   if (isSeeking) return;
   var d = aud.duration;
@@ -213,49 +192,31 @@ aud.addEventListener('timeupdate', function () {
   document.getElementById('t-cur').textContent = fmtTime(aud.currentTime);
   document.getElementById('t-tot').textContent = fmtTime(d);
 });
-
 aud.addEventListener('play',  function () { playing = true;  syncBtn(); renderList(); });
 aud.addEventListener('pause', function () { playing = false; syncBtn(); renderList(); });
 aud.addEventListener('ended', function () { playing = false; syncBtn(); if (!doLoop) nextTrack(); });
 
-// ── AudioContext for VISUALISER only ───────────────────────
-// Connected lazily on first user interaction.
-var actx         = null;
-var analyser     = null;
-var vizConnected = false;
-var fftData      = new Uint8Array(128);
+// ── AudioContext — visualiser tap only ──────────────────
+var actx = null, analyser = null, vizConnected = false;
+var fftData = new Uint8Array(128);
 
 function connectVisualiser() {
-  // Only do this once — createMediaElementSource can only be called once per element
   if (vizConnected) return;
   try {
-    actx     = new (window.AudioContext || window.webkitAudioContext)();
+    actx = new (window.AudioContext || window.webkitAudioContext)();
     analyser = actx.createAnalyser();
     analyser.fftSize = 256;
     analyser.smoothingTimeConstant = 0.82;
-    fftData  = new Uint8Array(analyser.frequencyBinCount);
-
-    // Source → analyser → destination
-    // Audio still plays via the aud element normally;
-    // this just taps into it for FFT data.
+    fftData = new Uint8Array(analyser.frequencyBinCount);
     var src = actx.createMediaElementSource(aud);
     src.connect(analyser);
     analyser.connect(actx.destination);
     vizConnected = true;
-  } catch (e) {
-    console.warn('AudioContext unavailable, visualiser will use fake data', e);
-  }
+  } catch(e) { console.warn('Visualiser AudioContext failed:', e); }
 }
 
-// Resume context if suspended (browser autoplay policy)
-function resumeCtx() {
-  if (actx && actx.state === 'suspended') actx.resume();
-}
-
-// ── YouTube IFrame API ──────────────────────────────────────
-var ytPlayer  = null;
-var ytReady   = false;
-var ytPending = null;
+// ── YouTube IFrame API ───────────────────────────────────
+var ytPlayer = null, ytReady = false, ytPending = null;
 
 window.onYouTubeIframeAPIReady = function () {
   ytPlayer = new YT.Player('yt-player', {
@@ -271,124 +232,88 @@ window.onYouTubeIframeAPIReady = function () {
         var S = YT.PlayerState;
         if (e.data === S.PLAYING) { playing = true;  syncBtn(); renderList(); startFake(); }
         if (e.data === S.PAUSED)  { playing = false; syncBtn(); renderList(); stopFake();  }
-        if (e.data === S.ENDED)   {
-          playing = false; syncBtn(); stopFake();
-          if (!doLoop) nextTrack(); else ytPlayer.playVideo();
-        }
+        if (e.data === S.ENDED)   { playing = false; syncBtn(); stopFake(); if (!doLoop) nextTrack(); else ytPlayer.playVideo(); }
       }
     }
   });
 };
 
-// ── Fake FFT for YouTube (cross-origin audio inaccessible) ──
-var fakeTimer = null;
-var fakeT     = 0;
-
+// ── Fake FFT for YouTube ─────────────────────────────────
+var fakeTimer = null, fakeT = 0;
 function startFake() {
   if (fakeTimer) return;
   fakeTimer = setInterval(function () {
     fakeT += 0.07;
-    for (var i = 0; i < fftData.length; i++) {
-      fftData[i] = Math.max(0, Math.min(255,
-        88 + 60 * Math.sin(fakeT + i * 0.27) +
-        30 * Math.sin(fakeT * 2.3 + i * 0.13) +
-        18 * (Math.random() - 0.5)));
-    }
+    for (var i = 0; i < fftData.length; i++)
+      fftData[i] = Math.max(0, Math.min(255, 88 + 60*Math.sin(fakeT+i*.27) + 30*Math.sin(fakeT*2.3+i*.13) + 18*(Math.random()-.5)));
   }, 33);
 }
-
 function stopFake() {
-  clearInterval(fakeTimer);
-  fakeTimer = null;
+  clearInterval(fakeTimer); fakeTimer = null;
   for (var i = 0; i < fftData.length; i++) fftData[i] = 0;
 }
 
-// ── Canvases ────────────────────────────────────────────────
-var bgC  = document.getElementById('bg-canvas');
-var bgX  = bgC.getContext('2d');
-var barC = document.getElementById('bar-canvas');
-var barX = barC.getContext('2d');
-var hue  = 0;
-
+// ── Canvases ─────────────────────────────────────────────
+var bgC = document.getElementById('bg-canvas'), bgX = bgC.getContext('2d');
+var barC = document.getElementById('bar-canvas'), barX = barC.getContext('2d');
+var hue = 0;
 function resizeCanvases() {
-  bgC.width  = window.innerWidth;
-  bgC.height = window.innerHeight;
-  barC.width  = barC.offsetWidth  || 720;
-  barC.height = barC.offsetHeight || 52;
+  bgC.width = window.innerWidth; bgC.height = window.innerHeight;
+  barC.width = barC.offsetWidth || 720; barC.height = barC.offsetHeight || 52;
 }
 window.addEventListener('resize', resizeCanvases);
 resizeCanvases();
 
-// ── Visualiser draw loop ────────────────────────────────────
 (function drawLoop() {
   requestAnimationFrame(drawLoop);
-
-  // Read real FFT when we have it
-  if (analyser && playing && !fakeTimer) {
-    analyser.getByteFrequencyData(fftData);
-  }
-
+  if (analyser && playing && !fakeTimer) analyser.getByteFrequencyData(fftData);
   var sum = 0;
   for (var j = 0; j < fftData.length; j++) sum += fftData[j];
-  var avg  = sum / fftData.length;
-  var bass = (fftData[0] + fftData[1] + fftData[2] + fftData[3] + fftData[4] + fftData[5]) / 6;
-  hue = (hue + 0.22 + (bass / 255) * 0.07) % 360;
-
+  var avg = sum / fftData.length;
+  var bass = (fftData[0]+fftData[1]+fftData[2]+fftData[3]+fftData[4]+fftData[5]) / 6;
+  hue = (hue + 0.22 + (bass/255)*0.07) % 360;
   var w = bgC.width, h = bgC.height;
-  bgX.fillStyle = 'rgba(8,8,8,0.19)';
-  bgX.fillRect(0, 0, w, h);
-
-  var rg = bgX.createRadialGradient(w/2, h/2, 0, w/2, h/2, 120 + (bass/255)*330 + (avg/255)*230);
-  rg.addColorStop(0,   'hsla('+hue+',100%,60%,'+(0.05+(avg/255)*0.12)+')');
-  rg.addColorStop(0.5, 'hsla('+(hue+55)+',80%,40%,'+(0.02+(avg/255)*0.05)+')');
-  rg.addColorStop(1,   'transparent');
-  bgX.fillStyle = rg;
-  bgX.fillRect(0, 0, w, h);
-
-  var corners = [[0,0],[w,0],[0,h],[w,h]];
-  for (var k = 0; k < corners.length; k++) {
-    var cx = corners[k][0], cy = corners[k][1];
-    var rr = bgX.createRadialGradient(cx, cy, 0, cx, cy, (bass/255)*150 + 25);
-    rr.addColorStop(0, 'hsla('+(hue+k*45)+',100%,58%,'+(bass/255)*0.11+')');
-    rr.addColorStop(1, 'transparent');
-    bgX.fillStyle = rr;
-    bgX.fillRect(0, 0, w, h);
-  }
-
+  bgX.fillStyle = 'rgba(8,8,8,0.19)'; bgX.fillRect(0,0,w,h);
+  var rg = bgX.createRadialGradient(w/2,h/2,0,w/2,h/2,120+(bass/255)*330+(avg/255)*230);
+  rg.addColorStop(0,'hsla('+hue+',100%,60%,'+(0.05+(avg/255)*0.12)+')');
+  rg.addColorStop(.5,'hsla('+(hue+55)+',80%,40%,'+(0.02+(avg/255)*0.05)+')');
+  rg.addColorStop(1,'transparent');
+  bgX.fillStyle = rg; bgX.fillRect(0,0,w,h);
+  [[0,0],[w,0],[0,h],[w,h]].forEach(function(c,k){
+    var rr = bgX.createRadialGradient(c[0],c[1],0,c[0],c[1],(bass/255)*150+25);
+    rr.addColorStop(0,'hsla('+(hue+k*45)+',100%,58%,'+(bass/255)*0.11+')');
+    rr.addColorStop(1,'transparent');
+    bgX.fillStyle = rr; bgX.fillRect(0,0,w,h);
+  });
   bgX.beginPath();
   for (var i = 0; i < fftData.length; i++) {
-    var x = (i / fftData.length) * w;
-    var y = h - (fftData[i] / 255) * h * 0.28;
-    if (i === 0) bgX.moveTo(x, y); else bgX.lineTo(x, y);
+    var x=(i/fftData.length)*w, y=h-(fftData[i]/255)*h*0.28;
+    i===0 ? bgX.moveTo(x,y) : bgX.lineTo(x,y);
   }
-  bgX.lineTo(w, h); bgX.lineTo(0, h); bgX.closePath();
-  bgX.fillStyle = 'hsla('+hue+',100%,58%,0.03)';
-  bgX.fill();
-
-  var bw = barC.width, bh = barC.height;
-  barX.clearRect(0, 0, bw, bh);
-  var n = Math.min(fftData.length, 70), gap = 1.5;
-  var barW = Math.max(2, (bw - (n-1)*gap) / n);
-  for (var i = 0; i < n; i++) {
-    var v = fftData[i] / 255;
-    barX.fillStyle = 'hsl('+(hue+i*2.5)+',100%,'+(46+v*32)+'%)';
-    barX.fillRect(i*(barW+gap), bh - Math.max(2, v*bh), barW, Math.max(2, v*bh));
+  bgX.lineTo(w,h); bgX.lineTo(0,h); bgX.closePath();
+  bgX.fillStyle='hsla('+hue+',100%,58%,0.03)'; bgX.fill();
+  var bw=barC.width, bh=barC.height;
+  barX.clearRect(0,0,bw,bh);
+  var n=Math.min(fftData.length,70), gap=1.5, barW=Math.max(2,(bw-(n-1)*gap)/n);
+  for (var i=0;i<n;i++) {
+    var v=fftData[i]/255;
+    barX.fillStyle='hsl('+(hue+i*2.5)+',100%,'+(46+v*32)+'%)';
+    barX.fillRect(i*(barW+gap), bh-Math.max(2,v*bh), barW, Math.max(2,v*bh));
   }
 })();
 
-// ── Playback ────────────────────────────────────────────────
+// ── Playback ─────────────────────────────────────────────
 function currentTrack() { return tracks[cur] || null; }
 
 function playTrack(i) {
-  // Stop everything currently running
+  // Always clear aud.src first — stops timeupdate dead for YT tracks
   aud.pause();
-  aud.removeAttribute('src');
+  aud.src = '';
   stopFake();
-  if (ytReady && ytPlayer) { try { ytPlayer.stopVideo(); } catch(e) {} }
+  if (ytReady && ytPlayer) { try { ytPlayer.stopVideo(); } catch(e){} }
   document.getElementById('yt-panel').style.display = 'none';
   playing = false;
 
-  // Reset progress UI
   var sb = document.getElementById('seekBar');
   sb.value = 0; fillRange(sb, 0);
   document.getElementById('prog-line').style.width = '0%';
@@ -403,276 +328,250 @@ function playTrack(i) {
   document.getElementById('track-src').textContent   = t.type.toUpperCase();
 
   if (t.type === 'file' || t.type === 'url') {
-    // Connect visualiser tap on first play (needs user gesture)
-    connectVisualiser();
-    resumeCtx();
-
-    aud.src    = t.src;
-    aud.volume = document.getElementById('volBar').value / 100;
-
-    // play() returns a Promise in modern browsers
-    var promise = aud.play();
-    if (promise !== undefined) {
-      promise.catch(function (err) {
-        console.warn('Autoplay blocked or error:', err);
-        playing = false; syncBtn();
-      });
+    if (!t.src) {
+      // Blob expired after reload — show offline state, don't try to play
+      document.getElementById('track-src').textContent = 'OFFLINE — RE-ADD FILE';
+      syncBtn(); renderList(); return;
     }
+    // Set src first, THEN connect visualiser, THEN resume ctx, THEN play
+    aud.src = t.src;
+    aud.volume = document.getElementById('volBar').value / 100;
+    aud.load();
+    connectVisualiser();
+    function doPlay() {
+      var p = aud.play();
+      if (p !== undefined) p.catch(function(e){ console.warn('play():', e); playing = false; syncBtn(); });
+    }
+    if (actx && actx.state === 'suspended') actx.resume().then(doPlay).catch(doPlay);
+    else doPlay();
 
   } else if (t.type === 'youtube') {
+    // aud.src is '' here — timeupdate will NOT fire — progress bar is safe
     document.getElementById('yt-panel').style.display = 'block';
-    if (ytReady && ytPlayer) {
-      ytPlayer.loadVideoById(t.id);
-      // ytPlayer fires onStateChange → PLAYING which sets playing=true
-    } else {
-      ytPending = t.id;
-    }
     document.getElementById('t-cur').textContent = '—:——';
     document.getElementById('t-tot').textContent = '—:——';
+    if (ytReady && ytPlayer) ytPlayer.loadVideoById(t.id);
+    else ytPending = t.id;
   }
 
-  syncBtn();
-  renderList();
+  syncBtn(); renderList();
 }
 
 function togglePlay() {
-  if (cur === -1) {
-    if (tracks.length > 0) playTrack(0);
-    return;
-  }
+  if (cur === -1) { if (tracks.length > 0) playTrack(0); return; }
   var t = currentTrack();
   if (!t) return;
-
   if (t.type === 'youtube') {
     if (!ytReady || !ytPlayer) return;
-    if (playing) ytPlayer.pauseVideo();
-    else         ytPlayer.playVideo();
-    // playing state set by onStateChange
+    if (playing) ytPlayer.pauseVideo(); else ytPlayer.playVideo();
   } else {
+    if (!t.src) return;
     if (playing) {
       aud.pause();
     } else {
-      resumeCtx();
-      var promise = aud.play();
-      if (promise !== undefined) {
-        promise.catch(function (err) { console.warn(err); });
+      function doResume() {
+        var p = aud.play();
+        if (p !== undefined) p.catch(function(e){ console.warn(e); });
       }
+      if (actx && actx.state === 'suspended') actx.resume().then(doResume).catch(doResume);
+      else doResume();
     }
-    // playing state set by play/pause events on aud
   }
 }
 
 function nextTrack() {
   if (!tracks.length) return;
-  var n = doShuffle
-    ? Math.floor(Math.random() * tracks.length)
-    : (cur + 1) % tracks.length;
-  playTrack(n);
+  playTrack(doShuffle ? Math.floor(Math.random()*tracks.length) : (cur+1)%tracks.length);
 }
-
 function prevTrack() {
   if (!tracks.length) return;
   var t = currentTrack();
-  if (t && t.type !== 'youtube' && aud.currentTime > 3) { aud.currentTime = 0; return; }
-  playTrack((cur - 1 + tracks.length) % tracks.length);
+  if (t && t.type !== 'youtube' && t.src && aud.currentTime > 3) { aud.currentTime = 0; return; }
+  playTrack((cur-1+tracks.length)%tracks.length);
 }
-
-function toggleShuffle() { doShuffle = !doShuffle; document.getElementById('btn-shuf').classList.toggle('on', doShuffle); }
-function toggleLoop()    { doLoop    = !doLoop;    aud.loop = doLoop; document.getElementById('btn-loop').classList.toggle('on', doLoop); }
+function toggleShuffle() { doShuffle=!doShuffle; document.getElementById('btn-shuf').classList.toggle('on',doShuffle); }
+function toggleLoop()    { doLoop=!doLoop; aud.loop=doLoop; document.getElementById('btn-loop').classList.toggle('on',doLoop); }
 function syncBtn()       { document.getElementById('btn-play').textContent = playing ? '⏸ PAUSE' : '▶ PLAY'; }
 
-// ── Seek bar ────────────────────────────────────────────────
+// ── Seek bar ──────────────────────────────────────────────
 var seekBar = document.getElementById('seekBar');
-
-seekBar.addEventListener('mousedown',  function () { isSeeking = true; });
-seekBar.addEventListener('touchstart', function () { isSeeking = true; }, { passive: true });
-seekBar.addEventListener('mouseup',    function () { isSeeking = false; });
-seekBar.addEventListener('touchend',   function () { isSeeking = false; });
-
-seekBar.addEventListener('input', function () {
+seekBar.addEventListener('mousedown',  function(){ isSeeking=true; });
+seekBar.addEventListener('touchstart', function(){ isSeeking=true; }, {passive:true});
+seekBar.addEventListener('mouseup',    function(){ isSeeking=false; });
+seekBar.addEventListener('touchend',   function(){ isSeeking=false; });
+seekBar.addEventListener('input', function(){
   var t = currentTrack();
-  if (!t || t.type === 'youtube') return;
+  if (!t || t.type==='youtube') return;
   var d = aud.duration;
-  if (d && isFinite(d)) {
-    aud.currentTime = (seekBar.value / 1000) * d;
-  }
-  var pct = seekBar.value / 10;
+  if (d && isFinite(d)) aud.currentTime = (seekBar.value/1000)*d;
+  var pct = seekBar.value/10;
   fillRange(seekBar, pct);
-  document.getElementById('prog-line').style.width = pct + '%';
-  if (d && isFinite(d)) {
-    document.getElementById('t-cur').textContent = fmtTime((seekBar.value / 1000) * d);
-  }
+  document.getElementById('prog-line').style.width = pct+'%';
+  if (d && isFinite(d)) document.getElementById('t-cur').textContent = fmtTime((seekBar.value/1000)*d);
 });
 
-// ── Volume bar ──────────────────────────────────────────────
+// ── Volume bar ────────────────────────────────────────────
 var volBar = document.getElementById('volBar');
-
 function applyVol() {
   var v = parseInt(volBar.value, 10);
-  aud.volume = v / 100;
-  document.getElementById('vol-num').textContent = v + '%';
+  aud.volume = v/100;
+  document.getElementById('vol-num').textContent = v+'%';
   fillRange(volBar, v);
-  if (ytReady && ytPlayer) { try { ytPlayer.setVolume(v); } catch(e) {} }
+  if (ytReady && ytPlayer) { try { ytPlayer.setVolume(v); } catch(e){} }
 }
 volBar.addEventListener('input', applyVol);
-applyVol(); // init fill on load
+applyVol();
 
-// ── Range fill helper ────────────────────────────────────────
 function fillRange(el, pct) {
   el.style.background = 'linear-gradient(to right,var(--accent) 0%,var(--accent) '+pct+'%,var(--border) '+pct+'%,var(--border) 100%)';
 }
 
-// ── Playlist render ──────────────────────────────────────────
+// ── Playlist render ───────────────────────────────────────
 function renderList() {
   var el = document.getElementById('pl-list');
-  if (!tracks.length) { el.innerHTML = '<div class="empty">Add tracks above to begin</div>'; return; }
-  el.innerHTML = tracks.map(function (t, i) {
+  if (!tracks.length) { el.innerHTML='<div class="empty">Add tracks above to begin</div>'; return; }
+  el.innerHTML = tracks.map(function(t,i){
+    var offline = (t.type==='file' && !t.src) ? '<span class="tr-offline">offline</span>' : '';
     return '<div class="tr'+(i===cur?' now':'')+'" onclick="playTrack('+i+')">' +
       '<span class="tr-num">'+(i===cur&&playing?'▶':i+1)+'</span>' +
       '<span class="tr-name">'+esc(t.name)+'</span>' +
+      offline +
       '<span class="tr-type">'+esc(t.type)+'</span>' +
       '<button class="tr-del" onclick="event.stopPropagation();delTrack('+i+')">✕</button>' +
       '</div>';
   }).join('');
 }
 
-// ── Add / remove tracks ──────────────────────────────────────
+// ── Add / remove tracks ───────────────────────────────────
 function pushTrack(t) {
-  tracks.push(t);
-  renderList(); persist();
-  if (cur === -1) playTrack(0);
+  tracks.push(t); renderList(); persist();
+  if (cur===-1) playTrack(0);
 }
 
 function delTrack(i) {
-  var wasActive = (i === cur);
+  var wasActive=(i===cur);
   if (wasActive) {
-    aud.pause(); aud.removeAttribute('src');
-    stopFake();
-    if (ytReady && ytPlayer) try { ytPlayer.stopVideo(); } catch(e) {}
-    document.getElementById('yt-panel').style.display = 'none';
-    playing = false; syncBtn();
-  } else if (i < cur) {
-    cur--;
-  }
-  tracks.splice(i, 1);
-  if (cur >= tracks.length) cur = tracks.length - 1;
+    aud.pause(); aud.src=''; stopFake();
+    if (ytReady&&ytPlayer) try{ytPlayer.stopVideo();}catch(e){}
+    document.getElementById('yt-panel').style.display='none';
+    playing=false; syncBtn();
+  } else if (i<cur) cur--;
+  tracks.splice(i,1);
+  if (cur>=tracks.length) cur=tracks.length-1;
   renderList(); persist();
-  if (wasActive && tracks.length > 0) playTrack(Math.max(0, cur));
+  if (wasActive && tracks.length>0) playTrack(Math.max(0,cur));
 }
 
 function clearAll() {
-  aud.pause(); aud.removeAttribute('src');
-  stopFake();
-  if (ytReady && ytPlayer) try { ytPlayer.stopVideo(); } catch(e) {}
-  document.getElementById('yt-panel').style.display = 'none';
-  playing = false; syncBtn();
-  tracks = []; cur = -1;
+  aud.pause(); aud.src=''; stopFake();
+  if (ytReady&&ytPlayer) try{ytPlayer.stopVideo();}catch(e){}
+  document.getElementById('yt-panel').style.display='none';
+  playing=false; syncBtn(); tracks=[]; cur=-1;
   renderList(); persist();
-  document.getElementById('track-title').textContent = 'No track loaded';
-  document.getElementById('track-src').textContent   = '—';
-  var sb = document.getElementById('seekBar'); sb.value = 0; fillRange(sb, 0);
-  document.getElementById('prog-line').style.width = '0%';
-  document.getElementById('t-cur').textContent = '0:00';
-  document.getElementById('t-tot').textContent = '0:00';
+  document.getElementById('track-title').textContent='No track loaded';
+  document.getElementById('track-src').textContent='—';
+  var sb=document.getElementById('seekBar'); sb.value=0; fillRange(sb,0);
+  document.getElementById('prog-line').style.width='0%';
+  document.getElementById('t-cur').textContent='0:00';
+  document.getElementById('t-tot').textContent='0:00';
 }
 
 function addFiles(files) {
-  Array.from(files).forEach(function (f) {
-    tracks.push({ name: f.name.replace(/\.[^.]+$/, ''), src: URL.createObjectURL(f), type: 'file' });
+  Array.from(files).forEach(function(f){
+    var name = f.name.replace(/\.[^.]+$/,'');
+    var blob = URL.createObjectURL(f);
+    // If an offline placeholder with this exact name exists, restore it in-place
+    for (var i=0; i<tracks.length; i++) {
+      if (tracks[i].type==='file' && !tracks[i].src && tracks[i].name===name) {
+        tracks[i].src = blob;
+        renderList(); persist(); return;
+      }
+    }
+    tracks.push({ name: name, src: blob, type: 'file' });
   });
   renderList(); persist();
-  if (cur === -1 && tracks.length > 0) playTrack(0);
+  if (cur===-1 && tracks.length>0) playTrack(0);
 }
 
 function addYT() {
-  var raw  = document.getElementById('yt-url').value.trim();
-  var name = document.getElementById('yt-name').value.trim();
+  var raw=document.getElementById('yt-url').value.trim();
+  var name=document.getElementById('yt-name').value.trim();
   if (!raw) return;
-  var id = raw;
-  var m  = raw.match(/(?:v=|youtu\.be\/|embed\/)([A-Za-z0-9_-]{11})/);
-  if (m) id = m[1];
+  var id=raw, m=raw.match(/(?:v=|youtu\.be\/|embed\/)([A-Za-z0-9_-]{11})/);
+  if (m) id=m[1];
   if (!/^[A-Za-z0-9_-]{11}$/.test(id)) { alert('Could not find a YouTube video ID in that URL.'); return; }
-  pushTrack({ name: name || 'YouTube · '+id, id: id, type: 'youtube' });
-  document.getElementById('yt-url').value = '';
-  document.getElementById('yt-name').value = '';
+  pushTrack({ name: name||'YouTube · '+id, id: id, type: 'youtube' });
+  document.getElementById('yt-url').value=''; document.getElementById('yt-name').value='';
 }
 
 function addURL() {
-  var src  = document.getElementById('url-link').value.trim();
-  var name = document.getElementById('url-name').value.trim();
+  var src=document.getElementById('url-link').value.trim();
+  var name=document.getElementById('url-name').value.trim();
   if (!src) return;
-  pushTrack({ name: name || (src.split('/').pop() || 'Audio Track'), src: src, type: 'url' });
-  document.getElementById('url-link').value = '';
-  document.getElementById('url-name').value = '';
+  pushTrack({ name: name||(src.split('/').pop()||'Audio Track'), src: src, type: 'url' });
+  document.getElementById('url-link').value=''; document.getElementById('url-name').value='';
 }
 
-// ── Tab switcher ─────────────────────────────────────────────
 function switchTab(id) {
-  var ids = ['file','yt','url'];
-  document.querySelectorAll('.tab-btn').forEach(function (b, i) { b.classList.toggle('on', ids[i]===id); });
-  document.querySelectorAll('.tab-pane').forEach(function (p) { p.classList.remove('on'); });
+  var ids=['file','yt','url'];
+  document.querySelectorAll('.tab-btn').forEach(function(b,i){ b.classList.toggle('on',ids[i]===id); });
+  document.querySelectorAll('.tab-pane').forEach(function(p){ p.classList.remove('on'); });
   document.getElementById('pane-'+id).classList.add('on');
 }
 
-// ── File drop zone ────────────────────────────────────────────
-var dz = document.getElementById('drop-zone');
+var dz=document.getElementById('drop-zone');
 dz.addEventListener('dragover',  function(e){ e.preventDefault(); dz.classList.add('over'); });
-dz.addEventListener('dragleave', function(){  dz.classList.remove('over'); });
+dz.addEventListener('dragleave', function(){ dz.classList.remove('over'); });
 dz.addEventListener('drop',      function(e){ e.preventDefault(); dz.classList.remove('over'); addFiles(e.dataTransfer.files); });
 
-// ── Persistence ───────────────────────────────────────────────
-var STORE_KEY = 'wave-v5';
+// ── Persistence ───────────────────────────────────────────
+// KEY CHANGE: save ALL track types.
+// - youtube / url: saved as-is, fully playable on reload
+// - file: saved with src:'' — blob is dead after reload but
+//   the name is remembered so the user sees it as "offline"
+//   and can drop the file back in to restore it instantly.
+var STORE_KEY = 'cornflakes-v1';
 
 function persist() {
-  var saveable = tracks.filter(function (t) { return t.type === 'youtube' || t.type === 'url'; });
+  var saveable = tracks.map(function(t){
+    if (t.type === 'file') return { name: t.name, type: 'file', src: '' };
+    return { name: t.name, type: t.type, src: t.src || '', id: t.id || '' };
+  });
   var json = JSON.stringify(saveable);
-  // Try localStorage (works when file is opened locally in a browser)
   try { localStorage.setItem(STORE_KEY, json); showSaved(); } catch(e) {}
-  // Also write to window.storage (claude.ai sandboxed iframe)
-  if (window.storage) {
-    window.storage.set(STORE_KEY, json).then(showSaved).catch(function(){});
-  }
+  if (window.storage) window.storage.set(STORE_KEY, json).then(showSaved).catch(function(){});
 }
 
 function loadSaved() {
-  // localStorage first
+  function apply(json) {
+    try {
+      var p = JSON.parse(json);
+      if (Array.isArray(p) && p.length) { tracks = p; renderList(); }
+    } catch(e) {}
+  }
   try {
     var raw = localStorage.getItem(STORE_KEY);
-    if (raw) {
-      var p = JSON.parse(raw);
-      if (Array.isArray(p) && p.length) { tracks = p; renderList(); return; }
-    }
+    if (raw) { apply(raw); return; }
   } catch(e) {}
-  // window.storage fallback
   if (window.storage) {
-    window.storage.get(STORE_KEY).then(function (res) {
-      if (res && res.value) {
-        try {
-          var p = JSON.parse(res.value);
-          if (Array.isArray(p) && p.length) { tracks = p; renderList(); }
-        } catch(e) {}
-      }
-    }).catch(function(){});
+    window.storage.get(STORE_KEY).then(function(res){ if(res&&res.value) apply(res.value); }).catch(function(){});
   }
 }
 
 function showSaved() {
-  var el = document.getElementById('saved-tag');
-  el.classList.add('show');
-  clearTimeout(el._t);
-  el._t = setTimeout(function () { el.classList.remove('show'); }, 2000);
+  var el=document.getElementById('saved-tag');
+  el.classList.add('show'); clearTimeout(el._t);
+  el._t=setTimeout(function(){ el.classList.remove('show'); }, 2000);
 }
 
-// ── Utils ─────────────────────────────────────────────────────
 function fmtTime(s) {
-  if (!isFinite(s) || s < 0) return '0:00';
-  return Math.floor(s/60) + ':' + String(Math.floor(s%60)).padStart(2,'0');
+  if (!isFinite(s)||s<0) return '0:00';
+  return Math.floor(s/60)+':'+String(Math.floor(s%60)).padStart(2,'0');
 }
 function esc(s) {
   return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
 
-// ── Boot ──────────────────────────────────────────────────────
 loadSaved();
 </script>
 </body>
