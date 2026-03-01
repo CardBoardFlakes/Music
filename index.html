@@ -285,18 +285,147 @@ window.onYouTubeIframeAPIReady = function() {
 };
 
 // ── Fake FFT for YouTube (cross-origin audio inaccessible) ────
-var fakeTimer = null, fakeT = 0;
+// ── Music-realistic fake FFT for YouTube ─────────────────────
+// Simulates real audio spectrum with:
+//   - BPM-locked bass kicks (4-on-the-floor pattern)
+//   - Snare hits on beats 2 & 4
+//   - Hi-hat 16th note flutter
+//   - Realistic frequency rolloff (bass > mids > highs)
+//   - Slow energy envelope that rises/falls like a real song
+//   - Harmonic overtones that follow the kick
+//   - Subtle noise floor across all bins
+
+var fakeTimer = null;
+var fakeState = {
+  t:        0,       // time in seconds (incremented each tick)
+  bpm:      128,     // tempo — randomised per session
+  energy:   0.7,     // overall energy envelope (0–1)
+  energyV:  0,       // velocity of energy change
+  kickDecay:0,       // current kick transient level
+  snrDecay: 0,       // current snare transient level
+  hatDecay: 0,       // current hihat transient level
+  smoothed: null,    // per-bin smoothed values
+};
+
 function startFake() {
   if (fakeTimer) return;
+
+  // Randomise BPM between 90–145 for variety
+  fakeState.bpm      = 90 + Math.random() * 55;
+  fakeState.t        = 0;
+  fakeState.energy   = 0.55 + Math.random() * 0.3;
+  fakeState.energyV  = 0;
+  fakeState.kickDecay = 0;
+  fakeState.snrDecay  = 0;
+  fakeState.hatDecay  = 0;
+  fakeState.smoothed  = new Float32Array(fftData.length);
+
+  var TICK = 1 / 30; // seconds per tick (~30fps update)
+
   fakeTimer = setInterval(function() {
-    fakeT += 0.07;
-    for (var i = 0; i < fftData.length; i++)
-      fftData[i] = Math.max(0, Math.min(255,
-        88 + 60*Math.sin(fakeT+i*.27) + 30*Math.sin(fakeT*2.3+i*.13) + 18*(Math.random()-.5)));
+    var s   = fakeState;
+    var n   = fftData.length; // 128 bins
+    s.t    += TICK;
+
+    // ── Beat timing ──────────────────────────────────────────
+    var beatSec   = 60 / s.bpm;
+    var beatPhase = (s.t % beatSec) / beatSec; // 0→1 each beat
+    var beatNum   = Math.floor(s.t / beatSec);
+    var bar       = beatNum % 4; // position in 4/4 bar (0–3)
+
+    // ── Transient triggers ────────────────────────────────────
+    if (beatPhase < TICK / beatSec) {
+      if (bar === 0 || bar === 2) { s.kickDecay = 1.0; }
+      else if (bar === 1 && Math.random() < 0.25) { s.kickDecay = 0.5; }
+      if (bar === 1 || bar === 3) { s.snrDecay = 1.0; }
+    }
+    // Hi-hat every 16th note
+    var sixteenth = (s.t % (beatSec / 4)) / (beatSec / 4);
+    if (sixteenth < TICK / (beatSec / 4)) {
+      s.hatDecay = 0.7 + Math.random() * 0.3;
+    }
+
+    // ── Decay — sharper so valleys are deeper ────────────────
+    s.kickDecay *= 0.70;  // punchier, decays faster → bigger contrast
+    s.snrDecay  *= 0.65;
+    s.hatDecay  *= 0.48;
+
+    // ── Dramatic energy envelope — wider swing ────────────────
+    s.energyV += (Math.random() - 0.502) * 0.018; // more volatile
+    s.energyV *= 0.88;
+    s.energy  += s.energyV;
+    s.energy   = Math.max(0.25, Math.min(1.0, s.energy)); // floor lower → deeper troughs
+
+    // ── Build-up pulse: every 8 bars, a swell ────────────────
+    var phraseBeat = beatNum % 32; // 8-bar phrase
+    var swell = phraseBeat > 24 ? (phraseBeat - 24) / 8 : 0; // ramps up last 2 bars
+
+    // ── Per-bin spectrum ──────────────────────────────────────
+    for (var i = 0; i < n; i++) {
+      var norm = i / n;
+
+      // Steeper rolloff so highs drop to near-zero between hits
+      var shelf;
+      if (norm < 0.07)       shelf = 1.0;
+      else if (norm < 0.18)  shelf = 1.0  - (norm-0.07)/0.11 * 0.30;
+      else if (norm < 0.40)  shelf = 0.70 - (norm-0.18)/0.22 * 0.42;
+      else if (norm < 0.70)  shelf = 0.28 - (norm-0.40)/0.30 * 0.20;
+      else                   shelf = 0.08 - (norm-0.70)/0.30 * 0.07;
+
+      // Kick: massive sub-bass spike, fast harmonic overtone
+      var kickContrib = 0;
+      if (norm < 0.08)  kickContrib = s.kickDecay * 1.1 * (1 - norm/0.08);
+      if (norm > 0.08 && norm < 0.20) kickContrib += s.kickDecay * 0.5 * (1-(norm-0.08)/0.12);
+
+      // Snare: broadband crack across mids
+      var snrContrib = 0;
+      if (norm > 0.22 && norm < 0.72) {
+        snrContrib = s.snrDecay * 0.85 * (1 - Math.abs(norm - 0.44) / 0.28);
+        snrContrib += s.snrDecay * 0.35 * Math.random();
+      }
+
+      // Hi-hat: crisp spike in high bins only
+      var hatContrib = 0;
+      if (norm > 0.60) hatContrib = s.hatDecay * Math.pow((norm - 0.60) / 0.40, 0.6) * 0.9;
+
+      // Melodic movement — more amplitude, more contrast
+      var melodic =
+        0.28 * Math.sin(s.t * 1.1 + i * 0.16) +
+        0.16 * Math.sin(s.t * 3.1 + i * 0.38) +
+        0.10 * Math.sin(s.t * 0.6 + i * 0.08) +
+        0.06 * Math.sin(s.t * 5.3 + i * 0.55); // faster shimmer
+
+      // Noise — more presence for realism
+      var noise = (Math.random() - 0.5) * 0.18;
+
+      // Swell boost across all bins
+      var swellBoost = swell * 0.35 * (1 - norm * 0.5);
+
+      // Combine — raised weights so peaks reach higher
+      var raw = (shelf * 0.80 + kickContrib * 0.75 + snrContrib * 0.55 +
+                 hatContrib * 0.45 + melodic * 0.28 + noise * 0.12 + swellBoost)
+                * s.energy;
+
+      // Clamp to 0–1, scale to 0–255
+      var target = Math.max(0, Math.min(1, raw)) * 255;
+
+      // Fast attack, slow release — but release is faster than before for snappier contrast
+      var prev = s.smoothed[i];
+      s.smoothed[i] = target > prev
+        ? prev + (target - prev) * 0.70   // very fast attack — peaks snap up
+        : prev + (target - prev) * 0.12;  // slow release — bars hang then fall
+
+      fftData[i] = Math.round(s.smoothed[i]);
+    }
   }, 33);
 }
+
 function stopFake() {
   clearInterval(fakeTimer); fakeTimer = null;
+  if (fakeState.smoothed) {
+    // Graceful fade-out: zero the smoothed state
+    for (var i = 0; i < fakeState.smoothed.length; i++) fakeState.smoothed[i] = 0;
+  }
   for (var i = 0; i < fftData.length; i++) fftData[i] = 0;
 }
 
