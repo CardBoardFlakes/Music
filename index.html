@@ -218,15 +218,22 @@ function deleteFileFromDB(id) {
   tx.objectStore(DB_STORE).delete(id);
 }
 
-// ── Audio element ─────────────────────────────────────────────
-// Never routed through AudioContext — plays independently.
+// ── Audio elements ────────────────────────────────────────────
+// Local files play through audFile, which is routed into the
+// AudioContext so the visualiser gets real FFT data.
+// URL tracks play through audURL, which is never routed: the browser
+// mutes cross-origin audio sent through an AudioContext, so URL tracks
+// use the fake FFT instead (same as YouTube).
+// `aud` always points at whichever one the current track uses.
 // aud.src is always '' when a YouTube track is active so
 // timeupdate cannot fire and corrupt the progress bar.
-var aud = new Audio();
-aud.volume = 0.8;
+var audFile = new Audio(), audURL = new Audio();
+var aud = audFile;
+audFile.volume = audURL.volume = 0.8;
 
-aud.addEventListener('timeupdate', function() {
-  if (isSeeking) return;
+[audFile, audURL].forEach(function(el) {
+el.addEventListener('timeupdate', function() {
+  if (this !== aud || isSeeking) return;
   var d = aud.duration;
   if (!d || !isFinite(d)) return;
   var pct = aud.currentTime / d;
@@ -237,9 +244,10 @@ aud.addEventListener('timeupdate', function() {
   document.getElementById('t-cur').textContent = fmtTime(aud.currentTime);
   document.getElementById('t-tot').textContent = fmtTime(d);
 });
-aud.addEventListener('play',  function() { playing = true;  syncBtn(); renderList(); });
-aud.addEventListener('pause', function() { playing = false; syncBtn(); renderList(); });
-aud.addEventListener('ended', function() { playing = false; syncBtn(); if (!doLoop) nextTrack(); });
+el.addEventListener('play',  function() { if (this !== aud) return; playing = true;  ytErrors = 0; syncBtn(); renderList(); if (aud === audURL) startFake(); });
+el.addEventListener('pause', function() { if (this !== aud) return; playing = false; syncBtn(); renderList(); if (aud === audURL) stopFake(); });
+el.addEventListener('ended', function() { if (this !== aud) return; playing = false; syncBtn(); if (!doLoop) nextTrack(); });
+});
 
 // ── AudioContext — visualiser tap only ───────────────────────
 var actx = null, analyser = null, vizConnected = false;
@@ -253,7 +261,7 @@ function connectVisualiser() {
     analyser.fftSize = 256;
     analyser.smoothingTimeConstant = 0.82;
     fftData  = new Uint8Array(analyser.frequencyBinCount);
-    var src  = actx.createMediaElementSource(aud);
+    var src  = actx.createMediaElementSource(audFile);
     src.connect(analyser);
     analyser.connect(actx.destination);
     vizConnected = true;
@@ -261,7 +269,25 @@ function connectVisualiser() {
 }
 
 // ── YouTube IFrame API ────────────────────────────────────────
-var ytPlayer = null, ytReady = false, ytPending = null;
+var ytPlayer = null, ytReady = false, ytPending = null, ytErrors = 0, ytTimer = null;
+
+// The YouTube player has no timeupdate event, so poll it while playing.
+function startYTProgress() {
+  if (ytTimer) return;
+  ytTimer = setInterval(function() {
+    var t = currentTrack();
+    if (!t || t.type !== 'youtube' || isSeeking) return;
+    var d = ytPlayer.getDuration(), c = ytPlayer.getCurrentTime();
+    if (!d || !isFinite(d)) return;
+    var pct = c / d;
+    seekBar.value = Math.round(pct * 1000);
+    fillRange(seekBar, pct * 100);
+    document.getElementById('prog-line').style.width = (pct * 100) + '%';
+    document.getElementById('t-cur').textContent = fmtTime(c);
+    document.getElementById('t-tot').textContent = fmtTime(d);
+  }, 250);
+}
+function stopYTProgress() { clearInterval(ytTimer); ytTimer = null; }
 
 window.onYouTubeIframeAPIReady = function() {
   ytPlayer = new YT.Player('yt-player', {
@@ -275,10 +301,23 @@ window.onYouTubeIframeAPIReady = function() {
       },
       onStateChange: function(e) {
         var S = YT.PlayerState;
-        if (e.data === S.PLAYING) { playing = true;  syncBtn(); renderList(); startFake(); }
-        if (e.data === S.PAUSED)  { playing = false; syncBtn(); renderList(); stopFake();  }
-        if (e.data === S.ENDED)   { playing = false; syncBtn(); stopFake();
+        if (e.data === S.PLAYING) { playing = true;  ytErrors = 0; syncBtn(); renderList(); startFake(); startYTProgress(); }
+        if (e.data === S.PAUSED)  { playing = false; syncBtn(); renderList(); stopFake(); stopYTProgress(); }
+        if (e.data === S.ENDED)   { playing = false; syncBtn(); stopFake(); stopYTProgress();
           if (!doLoop) nextTrack(); else ytPlayer.playVideo(); }
+      },
+      // Removed, private or non-embeddable videos: say so and move on,
+      // unless every track in a row has failed (avoids looping forever).
+      onError: function() {
+        var t = currentTrack();
+        if (!t || t.type !== 'youtube') return;
+        playing = false; syncBtn(); stopFake(); stopYTProgress();
+        document.getElementById('track-src').textContent = 'YOUTUBE · UNAVAILABLE';
+        ytErrors++;
+        if (ytErrors < tracks.length) {
+          var failed = cur;
+          setTimeout(function() { if (cur === failed) nextTrack(); }, 1500);
+        }
       }
     }
   });
@@ -485,11 +524,19 @@ resizeCanvases();
 // ══════════════════════════════════════════════════════════════
 function currentTrack() { return tracks[cur] || null; }
 
+var playToken = 0, blobURL = null;
+
 async function playTrack(i) {
+  // Each call gets a token. If another playTrack starts while this one is
+  // waiting on IndexedDB, this one gives up instead of starting stale audio.
+  var token = ++playToken;
   // Stop everything and clear aud.src so timeupdate can't fire during YT playback
   aud.pause();
   aud.src = '';
+  if (blobURL) { URL.revokeObjectURL(blobURL); blobURL = null; }
   stopFake();
+  stopYTProgress();
+  ytPending = null;
   if (ytReady && ytPlayer) { try { ytPlayer.stopVideo(); } catch(e){} }
   document.getElementById('yt-panel').style.display = 'none';
   playing = false;
@@ -511,11 +558,13 @@ async function playTrack(i) {
   if (t.type === 'file') {
     // Doc 4: retrieve the actual File from IndexedDB
     var file = await getFileFromDB(t.id);
+    if (token !== playToken) return;
     if (!file) {
       document.getElementById('track-src').textContent = 'FILE MISSING';
       syncBtn(); renderList(); return;
     }
-    aud.src    = URL.createObjectURL(file);
+    aud = audFile;
+    aud.src    = blobURL = URL.createObjectURL(file);
     aud.volume = document.getElementById('volBar').value / 100;
     aud.load();
     connectVisualiser();
@@ -527,16 +576,12 @@ async function playTrack(i) {
     else doPlayFile();
 
   } else if (t.type === 'url') {
+    aud = audURL;
     aud.src    = t.src;
     aud.volume = document.getElementById('volBar').value / 100;
     aud.load();
-    connectVisualiser();
-    function doPlayURL() {
-      var p = aud.play();
-      if (p) p.catch(function(e){ console.warn('play():', e); playing = false; syncBtn(); });
-    }
-    if (actx && actx.state === 'suspended') actx.resume().then(doPlayURL).catch(doPlayURL);
-    else doPlayURL();
+    var p = aud.play();
+    if (p) p.catch(function(e){ console.warn('play():', e); playing = false; syncBtn(); });
 
   } else if (t.type === 'youtube') {
     // aud.src is '' — timeupdate cannot fire — progress bar stays clean
@@ -582,18 +627,29 @@ function prevTrack() {
   playTrack((cur-1+tracks.length)%tracks.length);
 }
 function toggleShuffle() { doShuffle=!doShuffle; document.getElementById('btn-shuf').classList.toggle('on',doShuffle); }
-function toggleLoop()    { doLoop=!doLoop; aud.loop=doLoop; document.getElementById('btn-loop').classList.toggle('on',doLoop); }
+function toggleLoop()    { doLoop=!doLoop; audFile.loop=audURL.loop=doLoop; document.getElementById('btn-loop').classList.toggle('on',doLoop); }
 function syncBtn()       { document.getElementById('btn-play').textContent = playing ? '⏸ PAUSE' : '▶ PLAY'; }
 
 // ── Seek bar ──────────────────────────────────────────────────
 var seekBar = document.getElementById('seekBar');
 seekBar.addEventListener('mousedown',  function(){ isSeeking=true; });
 seekBar.addEventListener('touchstart', function(){ isSeeking=true; }, {passive:true});
-seekBar.addEventListener('mouseup',    function(){ isSeeking=false; });
-seekBar.addEventListener('touchend',   function(){ isSeeking=false; });
+// Listen on window so letting go outside the slider still ends the drag.
+window.addEventListener('mouseup',     function(){ isSeeking=false; });
+window.addEventListener('touchend',    function(){ isSeeking=false; });
 seekBar.addEventListener('input', function() {
   var t = currentTrack();
-  if (!t || t.type==='youtube') return;
+  if (!t) return;
+  if (t.type==='youtube') {
+    if (!ytReady || !ytPlayer) return;
+    var yd = ytPlayer.getDuration();
+    if (!yd) return;
+    ytPlayer.seekTo((seekBar.value/1000)*yd, true);
+    fillRange(seekBar, seekBar.value/10);
+    document.getElementById('prog-line').style.width = (seekBar.value/10)+'%';
+    document.getElementById('t-cur').textContent = fmtTime((seekBar.value/1000)*yd);
+    return;
+  }
   var d = aud.duration;
   if (d && isFinite(d)) aud.currentTime = (seekBar.value/1000)*d;
   var pct = seekBar.value/10;
@@ -606,7 +662,7 @@ seekBar.addEventListener('input', function() {
 var volBar = document.getElementById('volBar');
 function applyVol() {
   var v = parseInt(volBar.value, 10);
-  aud.volume = v/100;
+  audFile.volume = audURL.volume = v/100;
   document.getElementById('vol-num').textContent = v+'%';
   fillRange(volBar, v);
   if (ytReady && ytPlayer) { try { ytPlayer.setVolume(v); } catch(e){} }
@@ -673,7 +729,7 @@ function addURL() {
 async function delTrack(i) {
   var wasActive = (i === cur);
   if (wasActive) {
-    aud.pause(); aud.src=''; stopFake();
+    aud.pause(); aud.src=''; stopFake(); stopYTProgress();
     if (ytReady&&ytPlayer) try{ytPlayer.stopVideo();}catch(e){}
     document.getElementById('yt-panel').style.display='none';
     playing=false; syncBtn();
@@ -686,7 +742,7 @@ async function delTrack(i) {
 }
 
 function clearAll() {
-  aud.pause(); aud.src=''; stopFake();
+  aud.pause(); aud.src=''; stopFake(); stopYTProgress(); ytPending=null;
   if (ytReady&&ytPlayer) try{ytPlayer.stopVideo();}catch(e){}
   document.getElementById('yt-panel').style.display='none';
   playing=false; syncBtn();
